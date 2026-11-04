@@ -1,0 +1,14 @@
+# Streamlit & Python
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv/
+env/
+
+# Fichiers volumineux ou temporaires
+youtube_transcriber/cloudflared.exe
+youtube_transcriber/tunnel_url.txt
+youtube_transcriber/security_pin.txt
+security_pin.txt
+*.exe
