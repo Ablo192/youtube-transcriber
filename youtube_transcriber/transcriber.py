@@ -4,11 +4,17 @@ Permet d'extraire les sous-titres officiels et auto-générés de vidéos YouTub
 et de les formater en texte brut propre, optimisé pour la lecture humaine et les LLM (IA).
 """
 
+import os
 import re
 import json
+import shutil
+import subprocess
+import tempfile
 import urllib.request
 import urllib.error
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+import requests
 from youtube_transcript_api import (
     YouTubeTranscriptApi,
     TranscriptsDisabled,
@@ -275,13 +281,30 @@ def _format_success_result(
     is_generated: bool,
     include_timestamps: bool,
     include_header: bool,
-    available_languages: Optional[List[Dict[str, Any]]] = None
+    available_languages: Optional[List[Dict[str, Any]]] = None,
+    source_type: str = "subtitles"
 ) -> Dict[str, Any]:
     """Helper pour formater un résultat de transcription réussi."""
-    total_duration_sec = snippets[-1]['start'] + snippets[-1]['duration'] if isinstance(snippets[-1], dict) else (snippets[-1].start + snippets[-1].duration if snippets else 0.0)
+    if snippets:
+        last = snippets[-1]
+        total_duration_sec = (
+            last['start'] + last['duration']
+            if isinstance(last, dict)
+            else last.start + last.duration
+        )
+    else:
+        total_duration_sec = 0.0
+
     clean_body = build_paragraphs(snippets, include_timestamps=include_timestamps)
     total_words = len(clean_body.split())
     estimated_reading_time_min = max(1, round(total_words / 200))
+
+    if source_type == "groq_whisper":
+        source_label = "Transcription IA (Groq Whisper)"
+    elif is_generated:
+        source_label = "Générés automatiquement"
+    else:
+        source_label = "Manuels / Officiels"
 
     header = ""
     if include_header:
@@ -290,7 +313,7 @@ def _format_success_result(
             f"- **Chaîne / Auteur** : {metadata['author_name']}",
             f"- **Lien vidéo** : {metadata['video_url']}",
             f"- **Langue** : {lang_name} ({lang_code})",
-            f"- **Type de sous-titres** : {'Générés automatiquement' if is_generated else 'Manuels / Officiels'}",
+            f"- **Source** : {source_label}",
             f"- **Durée estimée** : {format_seconds(total_duration_sec)} (~{estimated_reading_time_min} min de lecture)",
             f"- **Nombre de mots** : {total_words:,}",
             "=" * 60,
@@ -307,6 +330,7 @@ def _format_success_result(
         "language": lang_name,
         "language_code": lang_code,
         "is_generated": is_generated,
+        "source_type": source_type,
         "duration_formatted": format_seconds(total_duration_sec),
         "word_count": total_words,
         "reading_time_min": estimated_reading_time_min,
@@ -316,21 +340,325 @@ def _format_success_result(
     }
 
 
-def get_youtube_transcript(
-    url_or_id: str,
+GROQ_MAX_FILE_BYTES = 24 * 1024 * 1024  # Marge de sécurité sous la limite de 25 Mo (palier gratuit Groq)
+GROQ_SUPPORTED_EXTS = {'.mp3', '.m4a', '.webm', '.mp4', '.mpga', '.wav', '.mpeg', '.ogg', '.flac'}
+
+
+def _get_media_duration(file_path: Path) -> float:
+    """Retourne la durée d'un fichier audio/vidéo en secondes via ffprobe, ou 0.0."""
+    ffprobe_bin = shutil.which("ffprobe")
+    if not ffprobe_bin:
+        return 0.0
+    try:
+        proc = subprocess.run(
+            [
+                ffprobe_bin, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(file_path)
+            ],
+            capture_output=True, text=True, timeout=15
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return float(proc.stdout.strip())
+    except Exception:
+        pass
+    return 0.0
+
+
+def _prepare_audio_chunks(input_path: Path, work_dir: Path) -> Tuple[List[Tuple[Path, float]], Optional[str]]:
+    """
+    Prépare un ou plusieurs fichiers audio <= 24 Mo pour l'API Groq.
+    Utilise ffmpeg pour compresser en MP3 mono 16kHz 32kbps (~14 Mo/h) et découper si nécessaire.
+    """
+    ffmpeg_bin = shutil.which("ffmpeg")
+    if not ffmpeg_bin:
+        if input_path.suffix.lower() in GROQ_SUPPORTED_EXTS and input_path.stat().st_size <= GROQ_MAX_FILE_BYTES:
+            return [(input_path, 0.0)], None
+        return [], (
+            "ffmpeg n'est pas installé sur ce système : impossible de compresser ou découper "
+            "l'audio dépassant 24 Mo. Installez ffmpeg (ou utilisez Streamlit Cloud avec packages.txt)."
+        )
+
+    compressed_mp3 = work_dir / "audio_compressed.mp3"
+    cmd = [
+        ffmpeg_bin, "-y", "-i", str(input_path),
+        "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
+        str(compressed_mp3)
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if proc.returncode != 0 or not compressed_mp3.exists():
+        return [], f"Échec de la conversion audio avec ffmpeg : {proc.stderr[-300:] if proc.stderr else 'erreur inconnue'}"
+
+    if compressed_mp3.stat().st_size <= GROQ_MAX_FILE_BYTES:
+        return [(compressed_mp3, 0.0)], None
+
+    # Si l'audio dépasse 24 Mo (ex: vidéo > ~1h40), découper en segments de 40 minutes
+    segment_seconds = 2400
+    chunk_pattern = str(work_dir / "chunk_%03d.mp3")
+    seg_cmd = [
+        ffmpeg_bin, "-y", "-i", str(compressed_mp3),
+        "-f", "segment", "-segment_time", str(segment_seconds),
+        "-c", "copy", chunk_pattern
+    ]
+    seg_proc = subprocess.run(seg_cmd, capture_output=True, text=True, timeout=300)
+    if seg_proc.returncode != 0:
+        return [], f"Échec du découpage audio : {seg_proc.stderr[-300:] if seg_proc.stderr else 'erreur inconnue'}"
+
+    chunk_files = sorted(work_dir.glob("chunk_*.mp3"))
+    if not chunk_files:
+        return [], "Aucun segment audio généré lors du découpage."
+
+    chunks_with_offsets: List[Tuple[Path, float]] = []
+    running_offset = 0.0
+    for cf in chunk_files:
+        chunks_with_offsets.append((cf, running_offset))
+        dur = _get_media_duration(cf)
+        running_offset += dur if dur > 0 else float(segment_seconds)
+
+    return chunks_with_offsets, None
+
+
+def _transcribe_chunks_with_groq(
+    chunks: List[Tuple[Path, float]],
+    api_key: str,
+    language_hint: Optional[str] = None
+) -> Tuple[List[Dict[str, Any]], str, Optional[str]]:
+    """
+    Envoie les segments audio à l'API Groq (whisper-large-v3-turbo) et assemble les snippets horodatés.
+    """
+    url = "https://api.groq.com/openai/v1/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {api_key.strip()}"}
+
+    all_snippets: List[Dict[str, Any]] = []
+    detected_language = language_hint or "auto"
+
+    for chunk_path, offset_sec in chunks:
+        data: Dict[str, Any] = {
+            "model": "whisper-large-v3-turbo",
+            "response_format": "verbose_json",
+            "temperature": "0",
+        }
+        if language_hint:
+            data["language"] = language_hint
+
+        with open(chunk_path, "rb") as f:
+            files = {"file": (chunk_path.name, f, "audio/mpeg")}
+            resp = requests.post(url, headers=headers, files=files, data=data, timeout=180)
+
+        if resp.status_code == 401:
+            return [], detected_language, "Clé API Groq invalide ou expirée (erreur 401)."
+        if resp.status_code == 429:
+            return [], detected_language, "Quota ou limite de requêtes Groq atteint (erreur 429). Réessayez dans un instant."
+        if resp.status_code >= 400:
+            return [], detected_language, f"Erreur API Groq ({resp.status_code}) : {resp.text[:300]}"
+
+        payload = resp.json()
+        if payload.get("language"):
+            detected_language = str(payload["language"])
+
+        segments = payload.get("segments") or []
+        if segments:
+            for seg in segments:
+                text = (seg.get("text") or "").strip()
+                if not text:
+                    continue
+                start = float(seg.get("start", 0.0)) + offset_sec
+                end = float(seg.get("end", start)) + offset_sec
+                all_snippets.append({
+                    "text": text,
+                    "start": start,
+                    "duration": max(0.0, end - start)
+                })
+        else:
+            full_text = (payload.get("text") or "").strip()
+            if full_text:
+                chunk_dur = _get_media_duration(chunk_path)
+                all_snippets.append({
+                    "text": full_text,
+                    "start": offset_sec,
+                    "duration": chunk_dur
+                })
+
+    if not all_snippets:
+        return [], detected_language, "L'API Groq n'a retourné aucune parole détectable dans cet audio."
+
+    return all_snippets, detected_language, None
+
+
+def _language_hint_from_prefs(preferred_languages: Optional[List[str]]) -> Optional[str]:
+    if not preferred_languages:
+        return None
+    first = preferred_languages[0].split("-")[0].lower()
+    return first if len(first) == 2 else None
+
+
+def _lang_display_name(code: str) -> str:
+    c = (code or "").lower()
+    if c.startswith("fr") or c == "french":
+        return "Français"
+    if c.startswith("en") or c == "english":
+        return "Anglais"
+    return code or "Auto"
+
+
+def _transcribe_url_via_groq(
+    url: str,
+    api_key: str,
+    preferred_languages: Optional[List[str]],
+    include_timestamps: bool,
+    include_header: bool,
+    metadata: Optional[Dict[str, Any]] = None,
+    video_id: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Télécharge uniquement la piste audio d'une URL via yt-dlp puis la transcrit avec Groq Whisper.
+    """
+    try:
+        import yt_dlp
+    except ImportError:
+        return {"success": False, "error": "yt-dlp n'est pas installé.", "video_id": video_id, "metadata": metadata}
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        work_dir = Path(tmp_dir)
+        out_template = str(work_dir / "source_audio.%(ext)s")
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": out_template,
+            "quiet": True,
+            "no_warnings": True,
+            "noplaylist": True,
+        }
+
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=True)
+        except Exception as e:
+            return {
+                "success": False,
+                "error": f"Impossible de télécharger l'audio de cette vidéo (blocage ou lien inaccessible) : {str(e)[:220]}",
+                "video_id": video_id,
+                "metadata": metadata
+            }
+
+        if metadata is None and info:
+            metadata = {
+                "title": info.get("title") or "Vidéo en ligne",
+                "author_name": info.get("uploader") or info.get("channel") or "Auteur inconnu",
+                "author_url": info.get("uploader_url") or "",
+                "thumbnail_url": info.get("thumbnail") or "",
+                "video_url": url
+            }
+
+        downloaded_files = [p for p in work_dir.glob("source_audio.*") if p.is_file()]
+        if not downloaded_files:
+            return {
+                "success": False,
+                "error": "Aucun fichier audio n'a pu être téléchargé pour cette vidéo.",
+                "video_id": video_id,
+                "metadata": metadata
+            }
+
+        chunks, prep_err = _prepare_audio_chunks(downloaded_files[0], work_dir)
+        if prep_err:
+            return {"success": False, "error": prep_err, "video_id": video_id, "metadata": metadata}
+
+        lang_hint = _language_hint_from_prefs(preferred_languages)
+        snippets, detected_lang, groq_err = _transcribe_chunks_with_groq(chunks, api_key, language_hint=lang_hint)
+        if groq_err:
+            return {"success": False, "error": groq_err, "video_id": video_id, "metadata": metadata}
+
+        return _format_success_result(
+            video_id=video_id or "url",
+            metadata=metadata or {"title": "Vidéo en ligne", "author_name": "Inconnu", "video_url": url},
+            snippets=snippets,
+            lang_name=_lang_display_name(detected_lang),
+            lang_code=detected_lang,
+            is_generated=True,
+            include_timestamps=include_timestamps,
+            include_header=include_header,
+            source_type="groq_whisper"
+        )
+
+
+def transcribe_uploaded_media(
+    file_bytes: bytes,
+    filename: str,
+    groq_api_key: str,
     preferred_languages: Optional[List[str]] = None,
     include_timestamps: bool = False,
     include_header: bool = True
 ) -> Dict[str, Any]:
     """
-    Extrait et formate la transcription complète d'une vidéo YouTube.
-    Bénéficie d'un double moteur (YouTubeTranscriptApi + secours automatique yt-dlp anti-blocage IP).
+    Extrait l'audio d'un fichier vidéo ou audio importé et le transcrit via Groq Whisper.
+    """
+    if not groq_api_key or not groq_api_key.strip():
+        return {"success": False, "error": "Clé API Groq requise pour transcrire un fichier audio/vidéo."}
+
+    metadata = {
+        "title": Path(filename).stem or "Fichier média",
+        "author_name": "Fichier local importé",
+        "author_url": "",
+        "thumbnail_url": "",
+        "video_url": filename
+    }
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        work_dir = Path(tmp_dir)
+        suffix = Path(filename).suffix or ".mp4"
+        input_path = work_dir / f"upload{suffix}"
+        input_path.write_bytes(file_bytes)
+
+        chunks, prep_err = _prepare_audio_chunks(input_path, work_dir)
+        if prep_err:
+            return {"success": False, "error": prep_err, "metadata": metadata}
+
+        lang_hint = _language_hint_from_prefs(preferred_languages)
+        snippets, detected_lang, groq_err = _transcribe_chunks_with_groq(chunks, groq_api_key, language_hint=lang_hint)
+        if groq_err:
+            return {"success": False, "error": groq_err, "metadata": metadata}
+
+        return _format_success_result(
+            video_id="local_file",
+            metadata=metadata,
+            snippets=snippets,
+            lang_name=_lang_display_name(detected_lang),
+            lang_code=detected_lang,
+            is_generated=True,
+            include_timestamps=include_timestamps,
+            include_header=include_header,
+            source_type="groq_whisper"
+        )
+
+
+def get_youtube_transcript(
+    url_or_id: str,
+    preferred_languages: Optional[List[str]] = None,
+    include_timestamps: bool = False,
+    include_header: bool = True,
+    groq_api_key: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    Extrait et formate la transcription complète d'une vidéo YouTube (ou autre lien vidéo si Groq est activé).
+    1. Sous-titres via YouTubeTranscriptApi (gratuit, instantané)
+    2. Secours sous-titres via yt-dlp (gratuit, instantané)
+    3. Secours audio IA via Groq Whisper si aucun sous-titre n'existe et qu'une clé Groq est fournie
     """
     if preferred_languages is None:
         preferred_languages = ['fr', 'fr-FR', 'fr-CA', 'en', 'en-US', 'en-GB']
 
-    video_id = extract_video_id(url_or_id)
+    candidate = (url_or_id or "").strip()
+    video_id = extract_video_id(candidate)
     if not video_id:
+        # Support de n'importe quelle URL vidéo (TikTok, Vimeo, Instagram, etc.) si Groq est configuré
+        if candidate.startswith(("http://", "https://")) and groq_api_key and groq_api_key.strip():
+            return _transcribe_url_via_groq(
+                url=candidate,
+                api_key=groq_api_key,
+                preferred_languages=preferred_languages,
+                include_timestamps=include_timestamps,
+                include_header=include_header
+            )
         return {
             "success": False,
             "error": "Lien YouTube invalide. Veuillez vérifier l'URL ou l'identifiant.",
@@ -403,10 +731,22 @@ def get_youtube_transcript(
             include_header=include_header
         )
 
-    # Si les deux moteurs n'ont rien trouvé
+    # Tentative 3 (Secours IA) : téléchargement audio + Groq Whisper si aucun sous-titre
+    if groq_api_key and groq_api_key.strip():
+        return _transcribe_url_via_groq(
+            url=f"https://www.youtube.com/watch?v={video_id}",
+            api_key=groq_api_key,
+            preferred_languages=preferred_languages,
+            include_timestamps=include_timestamps,
+            include_header=include_header,
+            metadata=metadata,
+            video_id=video_id
+        )
+
+    # Si aucun moteur n'a réussi
     return {
         "success": False,
-        "error": "Aucune transcription ou sous-titre disponible sur cette vidéo.",
+        "error": "Aucune transcription ou sous-titre disponible sur cette vidéo. Activez le secours IA Groq dans la barre latérale pour la transcrire depuis l'audio.",
         "video_id": video_id,
         "metadata": metadata
     }
