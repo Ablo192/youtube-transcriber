@@ -522,24 +522,46 @@ def _transcribe_url_via_groq(
     with tempfile.TemporaryDirectory() as tmp_dir:
         work_dir = Path(tmp_dir)
         out_template = str(work_dir / "source_audio.%(ext)s")
-        ydl_opts = {
-            "format": "bestaudio/best",
-            "outtmpl": out_template,
-            "quiet": True,
-            "no_warnings": True,
-            "noplaylist": True,
-        }
 
-        try:
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(url, download=True)
-        except Exception as e:
-            return {
-                "success": False,
-                "error": f"Impossible de télécharger l'audio de cette vidéo (blocage ou lien inaccessible) : {str(e)[:220]}",
-                "video_id": video_id,
-                "metadata": metadata
+        # Plusieurs profils clients YouTube pour contourner les erreurs 403 sur IP cloud
+        client_profiles = [
+            {"youtube": {"player_client": ["android_vr", "tv"]}},
+            {"youtube": {"player_client": ["ios", "mweb"]}},
+            {},
+        ]
+
+        info = None
+        last_error = ""
+        downloaded_files: List[Path] = []
+
+        for profile in client_profiles:
+            # Nettoyer d'éventuels fichiers partiels d'une tentative précédente
+            for old in work_dir.glob("source_audio.*"):
+                old.unlink(missing_ok=True)
+
+            ydl_opts: Dict[str, Any] = {
+                "format": "bestaudio[ext=m4a]/bestaudio/best",
+                "outtmpl": out_template,
+                "quiet": True,
+                "no_warnings": True,
+                "noplaylist": True,
+                "nocheckcertificate": True,
             }
+            if profile:
+                ydl_opts["extractor_args"] = profile
+
+            try:
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(url, download=True)
+                downloaded_files = [
+                    p for p in work_dir.glob("source_audio.*")
+                    if p.is_file() and not p.name.endswith(".part")
+                ]
+                if downloaded_files:
+                    break
+            except Exception as e:
+                last_error = str(e)
+                continue
 
         if metadata is None and info:
             metadata = {
@@ -550,11 +572,16 @@ def _transcribe_url_via_groq(
                 "video_url": url
             }
 
-        downloaded_files = [p for p in work_dir.glob("source_audio.*") if p.is_file()]
         if not downloaded_files:
+            hint = (
+                " (YouTube bloque le téléchargement audio depuis l'IP du serveur cloud. "
+                "Astuce : téléchargez l'audio/vidéo sur votre appareil et importez-le dans l'onglet « 📁 Fichier Audio / Vidéo ».)"
+                if "403" in last_error
+                else ""
+            )
             return {
                 "success": False,
-                "error": "Aucun fichier audio n'a pu être téléchargé pour cette vidéo.",
+                "error": f"Impossible de télécharger l'audio de cette vidéo : {last_error[:220]}{hint}",
                 "video_id": video_id,
                 "metadata": metadata
             }
