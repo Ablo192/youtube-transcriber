@@ -445,7 +445,7 @@ with tab_upload:
         if st.button("🎙️ Transcrire ce fichier", type="primary", key="btn_transcribe_file", disabled=not bool(manual_groq_key)):
             with st.spinner("⚙️ Extraction de l'audio et transcription via Groq Whisper..."):
                 file_res = transcribe_uploaded_media(
-                    file_bytes=uploaded_media.getvalue(),
+                    file_stream=uploaded_media,
                     filename=uploaded_media.name,
                     groq_api_key=manual_groq_key,
                     preferred_languages=preferred_langs,

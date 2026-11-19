@@ -609,15 +609,17 @@ def _transcribe_url_via_groq(
 
 
 def transcribe_uploaded_media(
-    file_bytes: bytes,
-    filename: str,
-    groq_api_key: str,
+    file_bytes: Optional[bytes] = None,
+    filename: str = "media.mp4",
+    groq_api_key: str = "",
     preferred_languages: Optional[List[str]] = None,
     include_timestamps: bool = False,
-    include_header: bool = True
+    include_header: bool = True,
+    file_stream: Any = None
 ) -> Dict[str, Any]:
     """
     Extrait l'audio d'un fichier vidéo ou audio importé et le transcrit via Groq Whisper.
+    Supporte le streaming sur disque (file_stream) pour éviter de saturer la RAM sur les gros fichiers (jusqu'à 1 Go).
     """
     if not groq_api_key or not groq_api_key.strip():
         return {"success": False, "error": "Clé API Groq requise pour transcrire un fichier audio/vidéo."}
@@ -634,7 +636,15 @@ def transcribe_uploaded_media(
         work_dir = Path(tmp_dir)
         suffix = Path(filename).suffix or ".mp4"
         input_path = work_dir / f"upload{suffix}"
-        input_path.write_bytes(file_bytes)
+        if file_stream is not None:
+            if hasattr(file_stream, "seek"):
+                file_stream.seek(0)
+            with open(input_path, "wb") as out_f:
+                shutil.copyfileobj(file_stream, out_f, length=4 * 1024 * 1024)
+        elif file_bytes is not None:
+            input_path.write_bytes(file_bytes)
+        else:
+            return {"success": False, "error": "Aucun contenu média reçu.", "metadata": metadata}
 
         chunks, prep_err = _prepare_audio_chunks(input_path, work_dir)
         if prep_err:
